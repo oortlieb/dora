@@ -234,7 +234,7 @@ pub fn pydict_to_metadata(dict: Option<Bound<'_, PyDict>>) -> Result<MetadataPar
                 let list: Vec<String> = value.extract()?;
                 parameters.insert(key, Parameter::ListString(list))
             } else {
-                println!("could not convert type {value}");
+                // println!("could not convert type {value}");
                 parameters.insert(key, Parameter::String(value.str()?.to_string()))
             };
         }
