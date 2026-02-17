@@ -1,6 +1,8 @@
 nodes:
   - id: node1
     path: ./receive_data.py
+    restart_policy: always
+    restart_sec: 30
     inputs:
       data: node2/data
     outputs:
@@ -8,7 +10,18 @@ nodes:
 
   - id: node2
     path: ./receive_data.py
+    restart_policy: always
+    restart_sec: 30
     inputs:
       data: node1/data
+    outputs:
+      - data
+
+  - id: node3
+    path: ./receive_data.py
+    restart_policy: always
+    restart_sec: 30
+    inputs:
+      timer: dora/timer/millis/100
     outputs:
       - data

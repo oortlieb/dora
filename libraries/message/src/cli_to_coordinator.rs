@@ -91,4 +91,18 @@ pub enum ControlRequest {
     },
     CliAndDefaultDaemonOnSameMachine,
     GetNodeInfo,
+    NodeStop {
+        dataflow_uuid: Uuid,
+        node_id: NodeId,
+        grace_duration: Option<Duration>,
+    },
+    NodeStart {
+        dataflow_uuid: Uuid,
+        node_id: NodeId,
+    },
+    NodeKill {
+        dataflow_uuid: Uuid,
+        node_id: NodeId,
+        grace_duration: Option<Duration>,
+    },
 }

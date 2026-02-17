@@ -55,6 +55,20 @@ pub enum DaemonCoordinatorEvent {
         node_id: NodeId,
         tail: Option<usize>,
     },
+    StopNode {
+        dataflow_id: DataflowId,
+        node_id: NodeId,
+        grace_duration: Option<Duration>,
+    },
+    StartNode {
+        dataflow_id: DataflowId,
+        node_id: NodeId,
+    },
+    KillNode {
+        dataflow_id: DataflowId,
+        node_id: NodeId,
+        grace_duration: Option<Duration>,
+    },
     Destroy,
     Heartbeat,
 }

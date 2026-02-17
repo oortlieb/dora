@@ -107,7 +107,14 @@ fn list(
     let entries: Vec<OutputEntry> = filtered_nodes
         .into_iter()
         .map(|node| {
-            let (status, pid, cpu, memory) = if node.stopped {
+            let (status, pid, cpu, memory) = if node.manually_stopped {
+                (
+                    "Stopped (Manual)".to_string(),
+                    "-".to_string(),
+                    "-".to_string(),
+                    "-".to_string(),
+                )
+            } else if node.stopped {
                 let status = if node.restarting {
                     "Stopped (Restarting)".to_string()
                 } else {

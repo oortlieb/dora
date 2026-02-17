@@ -1,5 +1,5 @@
 use crate::{
-    CoreNodeKindExt, DoraEvent, Event, OutputId, ProcessOperation, RunningNode,
+    CoreNodeKindExt, DoraEvent, Event, NodeCommand, OutputId, ProcessOperation, RunningNode,
     log::{self, NodeLogger},
 };
 use aligned_vec::{AVec, ConstAlign};
@@ -39,6 +39,22 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 
+enum NormalExitOutcome {
+    /// Node was successfully respawned; contains the new finished_rx.
+    Respawned(oneshot::Receiver<NodeProcessFinished>),
+    /// Loop should break (node won't restart or fatal error).
+    Break,
+    /// Command channel closed, exit immediately.
+    ChannelClosed,
+}
+
+enum RespawnOutcome {
+    /// Respawn succeeded; contains the new finished_rx.
+    Ok(oneshot::Receiver<NodeProcessFinished>),
+    /// Respawn failed fatally.
+    Fatal,
+}
+
 #[derive(Clone)]
 pub struct PreparedNode {
     pub(super) command: Option<clonable_command::Command>,
@@ -71,6 +87,7 @@ impl PreparedNode {
 
         let disable_restart = Arc::new(AtomicBool::new(false));
         let pid = Arc::new(AtomicU32::new(0));
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
         let running_node = RunningNode {
             process: match &kind {
                 NodeKind::Dynamic => None,
@@ -79,6 +96,9 @@ impl PreparedNode {
             node_config: self.node_config.clone(),
             restart_policy: self.restart_policy(),
             disable_restart: disable_restart.clone(),
+            command_tx,
+            manually_stopped: false,
+            grace_timer_handle: None,
             pid: match kind {
                 NodeKind::Dynamic => None,
                 NodeKind::Spawned { pid: new_pid } => {
@@ -88,7 +108,13 @@ impl PreparedNode {
             },
         };
 
-        tokio::spawn(self.restart_loop(logger, finished_rx, disable_restart, pid));
+        tokio::spawn(self.restart_loop(
+            logger,
+            finished_rx,
+            disable_restart,
+            pid,
+            command_rx,
+        ));
 
         Ok(running_node)
     }
@@ -110,128 +136,425 @@ impl PreparedNode {
     async fn restart_loop(
         self,
         mut logger: NodeLogger<'static>,
-        mut finished_rx: oneshot::Receiver<NodeProcessFinished>,
+        finished_rx: oneshot::Receiver<NodeProcessFinished>,
         disable_restart: Arc<AtomicBool>,
         pid: Arc<AtomicU32>,
+        mut command_rx: mpsc::UnboundedReceiver<NodeCommand>,
     ) {
+        // Tracks the op_rx for passing to the next spawn_inner call.
+        let mut last_op_rx: Option<flume::Receiver<ProcessOperation>> = None;
+        // Use Option to allow taking by value from the loop.
+        let mut finished_rx_opt = Some(finished_rx);
+
         loop {
-            let Ok(NodeProcessFinished { exit_status, op_rx }) = finished_rx.await else {
+            let mut finished_rx = match finished_rx_opt.take() {
+                Some(rx) => rx,
+                None => break,
+            };
+
+            // ── State 1: Running ──
+            // Wait for the process to exit OR a control command.
+            enum RunningOutcome {
+                ProcessExited(NodeProcessFinished),
+                StopRequested(oneshot::Receiver<NodeProcessFinished>),
+                KillRequested(oneshot::Receiver<NodeProcessFinished>),
+                ChannelClosed,
+            }
+
+            let outcome = tokio::select! {
+                result = &mut finished_rx => {
+                    match result {
+                        Ok(finished) => RunningOutcome::ProcessExited(finished),
+                        Err(_) => {
+                            logger
+                                .log(
+                                    LogLevel::Error,
+                                    Some("daemon".into()),
+                                    "failed to receive finished signal".to_string(),
+                                )
+                                .await;
+                            RunningOutcome::ChannelClosed
+                        }
+                    }
+                }
+                cmd = command_rx.recv() => {
+                    match cmd {
+                        Some(NodeCommand::Stop) => RunningOutcome::StopRequested(finished_rx),
+                        Some(NodeCommand::Kill) => RunningOutcome::KillRequested(finished_rx),
+                        Some(NodeCommand::Start) => {
+                            // Already running, put finished_rx back and continue
+                            finished_rx_opt = Some(finished_rx);
+                            continue;
+                        }
+                        None => RunningOutcome::ChannelClosed,
+                    }
+                }
+            };
+
+            match outcome {
+                RunningOutcome::ChannelClosed => break,
+                RunningOutcome::StopRequested(rx) => {
+                    // The daemon has already sent NodeEvent::Stop to the process.
+                    // Start commands are rejected at the daemon level while the
+                    // grace timer handle is present, so we only need to wait for
+                    // the process to exit.
+                    let Ok(finished) = rx.await else {
+                        logger
+                            .log(
+                                LogLevel::Error,
+                                Some("daemon".into()),
+                                "failed to receive finished signal after stop command".to_string(),
+                            )
+                            .await;
+                        break;
+                    };
+                    let exit_status = finished.exit_status;
+                    last_op_rx = Some(finished.op_rx);
+
+                    // Send SpawnedNodeResult with manually_stopped=true so the daemon
+                    // keeps outputs open and does not remove us from running_nodes.
+                    let event = DoraEvent::SpawnedNodeResult {
+                        dataflow_id: self.dataflow_id,
+                        node_id: self.node.id.clone(),
+                        exit_status,
+                        dynamic_node: self.node.kind.dynamic(),
+                        restart: false,
+                        manually_stopped: true,
+                    }
+                    .into();
+                    let event = Timestamped {
+                        inner: event,
+                        timestamp: self.clock.clone().new_timestamp(),
+                    };
+                    let _ = self.daemon_tx.clone().send(event).await;
+
+                    logger
+                        .log(
+                            LogLevel::Info,
+                            Some("daemon".into()),
+                            "node manually stopped, entering parked state".to_string(),
+                        )
+                        .await;
+
+                    // ── State 3: Parked ──
+                    // Wait for a Start command to respawn.
+                    loop {
+                        match command_rx.recv().await {
+                            Some(NodeCommand::Start) => {
+                                logger
+                                    .log(
+                                        LogLevel::Info,
+                                        Some("daemon".into()),
+                                        "received start command, respawning node".to_string(),
+                                    )
+                                    .await;
+                                break;
+                            }
+                            Some(NodeCommand::Stop) | Some(NodeCommand::Kill) => {
+                                // Already stopped, ignore
+                                continue;
+                            }
+                            None => {
+                                // Channel closed, exit loop
+                                return;
+                            }
+                        }
+                    }
+
+                    // Respawn the node
+                    let op_rx = last_op_rx.take().expect("op_rx should be set in parked state");
+                    match self.do_respawn(&mut logger, op_rx, &pid).await {
+                        RespawnOutcome::Ok(new_rx) => {
+                            finished_rx_opt = Some(new_rx);
+                            continue;
+                        }
+                        RespawnOutcome::Fatal => break,
+                    }
+                }
+                RunningOutcome::KillRequested(rx) => {
+                    // The daemon has already killed the process.
+                    // Wait for the process to actually exit, then handle restart normally.
+                    let Ok(finished) = rx.await else {
+                        logger
+                            .log(
+                                LogLevel::Error,
+                                Some("daemon".into()),
+                                "failed to receive finished signal after kill command".to_string(),
+                            )
+                            .await;
+                        break;
+                    };
+                    let exit_status = finished.exit_status;
+                    last_op_rx = Some(finished.op_rx);
+
+                    match self
+                        .handle_normal_exit(
+                            &mut logger,
+                            exit_status,
+                            &disable_restart,
+                            &pid,
+                            &mut command_rx,
+                            &mut last_op_rx,
+                        )
+                        .await
+                    {
+                        NormalExitOutcome::Respawned(new_rx) => {
+                            finished_rx_opt = Some(new_rx);
+                            continue;
+                        }
+                        NormalExitOutcome::Break | NormalExitOutcome::ChannelClosed => break,
+                    }
+                }
+                RunningOutcome::ProcessExited(finished) => {
+                    let exit_status = finished.exit_status;
+                    last_op_rx = Some(finished.op_rx);
+
+                    match self
+                        .handle_normal_exit(
+                            &mut logger,
+                            exit_status,
+                            &disable_restart,
+                            &pid,
+                            &mut command_rx,
+                            &mut last_op_rx,
+                        )
+                        .await
+                    {
+                        NormalExitOutcome::Respawned(new_rx) => {
+                            finished_rx_opt = Some(new_rx);
+                            continue;
+                        }
+                        NormalExitOutcome::Break | NormalExitOutcome::ChannelClosed => break,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle a normal process exit (not a manual stop).
+    async fn handle_normal_exit(
+        &self,
+        logger: &mut NodeLogger<'_>,
+        exit_status: NodeExitStatus,
+        disable_restart: &Arc<AtomicBool>,
+        pid: &Arc<AtomicU32>,
+        command_rx: &mut mpsc::UnboundedReceiver<NodeCommand>,
+        last_op_rx: &mut Option<flume::Receiver<ProcessOperation>>,
+    ) -> NormalExitOutcome {
+        let restart = match self.restart_policy() {
+            RestartPolicy::Always => true,
+            RestartPolicy::OnFailure if exit_status.is_success() => false,
+            RestartPolicy::OnFailure => true,
+            RestartPolicy::Never => false,
+        };
+
+        let restart_disabled = disable_restart.load(atomic::Ordering::Acquire);
+        if restart && restart_disabled {
+            logger
+                .log(
+                    LogLevel::Info,
+                    Some("daemon".into()),
+                    "not restarting node because all inputs are already closed".to_string(),
+                )
+                .await;
+        }
+        let restart = restart && !restart_disabled;
+        let success = exit_status.is_success();
+
+        if !success {
+            let _span = tracing::error_span!(
+                "node_failure",
+                node_id = %self.node.id,
+                dataflow_id = %self.dataflow_id
+            )
+            .entered();
+            tracing::error!("node exited with error: {:?}", exit_status);
+        }
+
+        let event = DoraEvent::SpawnedNodeResult {
+            dataflow_id: self.dataflow_id,
+            node_id: self.node.id.clone(),
+            exit_status,
+            dynamic_node: self.node.kind.dynamic(),
+            restart,
+            manually_stopped: false,
+        }
+        .into();
+        let event = Timestamped {
+            inner: event,
+            timestamp: self.clock.clone().new_timestamp(),
+        };
+        let _ = self.daemon_tx.clone().send(event).await;
+
+        if !restart {
+            return NormalExitOutcome::Break;
+        }
+
+        // ── State 2: WaitingRestart ──
+        let restart_sec = self.restart_sec();
+        if restart_sec > 0 {
+            logger
+                .log(
+                    LogLevel::Info,
+                    Some("daemon".into()),
+                    format!("waiting {restart_sec}s before restarting node"),
+                )
+                .await;
+
+            // Interruptible sleep: listen for commands during the delay.
+            let sleep = tokio::time::sleep(Duration::from_secs(restart_sec));
+            tokio::pin!(sleep);
+
+            loop {
+                tokio::select! {
+                    _ = &mut sleep => {
+                        // Delay elapsed, proceed to respawn
+                        break;
+                    }
+                    cmd = command_rx.recv() => {
+                        match cmd {
+                            Some(NodeCommand::Stop) => {
+                                logger
+                                    .log(
+                                        LogLevel::Info,
+                                        Some("daemon".into()),
+                                        "stop command received during restart delay, entering parked state".to_string(),
+                                    )
+                                    .await;
+
+                                // Send manually_stopped event
+                                let event = DoraEvent::SpawnedNodeResult {
+                                    dataflow_id: self.dataflow_id,
+                                    node_id: self.node.id.clone(),
+                                    exit_status: NodeExitStatus::Success,
+                                    dynamic_node: self.node.kind.dynamic(),
+                                    restart: false,
+                                    manually_stopped: true,
+                                }
+                                .into();
+                                let event = Timestamped {
+                                    inner: event,
+                                    timestamp: self.clock.clone().new_timestamp(),
+                                };
+                                let _ = self.daemon_tx.clone().send(event).await;
+
+                                // Enter parked state
+                                loop {
+                                    match command_rx.recv().await {
+                                        Some(NodeCommand::Start) => {
+                                            logger
+                                                .log(
+                                                    LogLevel::Info,
+                                                    Some("daemon".into()),
+                                                    "received start command, respawning node".to_string(),
+                                                )
+                                                .await;
+                                            break;
+                                        }
+                                        Some(_) => continue,
+                                        None => return NormalExitOutcome::ChannelClosed,
+                                    }
+                                }
+                                // Fall through to respawn below
+                                break;
+                            }
+                            Some(NodeCommand::Start) => {
+                                logger
+                                    .log(
+                                        LogLevel::Info,
+                                        Some("daemon".into()),
+                                        "start command received during restart delay, spawning immediately".to_string(),
+                                    )
+                                    .await;
+                                // Skip remaining delay, proceed to respawn
+                                break;
+                            }
+                            Some(NodeCommand::Kill) => {
+                                // Process is already dead, restart will proceed normally
+                                continue;
+                            }
+                            None => return NormalExitOutcome::ChannelClosed,
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check if restart was disabled during the delay (e.g. all inputs closed)
+        if disable_restart.load(atomic::Ordering::Acquire) {
+            logger
+                .log(
+                    LogLevel::Info,
+                    Some("daemon".into()),
+                    "restart disabled during delay, not restarting".to_string(),
+                )
+                .await;
+            return NormalExitOutcome::Break;
+        }
+
+        if success {
+            logger
+                .log(
+                    LogLevel::Info,
+                    Some("daemon".into()),
+                    "restarting node after successful exit".to_string(),
+                )
+                .await;
+        } else {
+            logger
+                .log(
+                    LogLevel::Warn,
+                    Some("daemon".into()),
+                    "restarting node after failure".to_string(),
+                )
+                .await;
+        }
+
+        let op_rx = last_op_rx
+            .take()
+            .expect("op_rx should be set after process exit");
+        match self.do_respawn(logger, op_rx, pid).await {
+            RespawnOutcome::Ok(new_rx) => NormalExitOutcome::Respawned(new_rx),
+            RespawnOutcome::Fatal => NormalExitOutcome::Break,
+        }
+    }
+
+    /// Respawn the node process.
+    async fn do_respawn(
+        &self,
+        logger: &mut NodeLogger<'_>,
+        op_rx: flume::Receiver<ProcessOperation>,
+        pid: &Arc<AtomicU32>,
+    ) -> RespawnOutcome {
+        let (finished_tx, finished_rx_new) = oneshot::channel();
+        let result = self
+            .clone()
+            .spawn_inner(logger, op_rx, finished_tx)
+            .await;
+        match result {
+            Ok(NodeKind::Spawned { pid: new_pid }) => {
+                pid.store(new_pid, atomic::Ordering::Release);
+                RespawnOutcome::Ok(finished_rx_new)
+            }
+            Ok(NodeKind::Dynamic) => {
                 logger
                     .log(
                         LogLevel::Error,
                         Some("daemon".into()),
-                        "failed to receive finished signal".to_string(),
+                        "cannot restart dynamic node".to_string(),
                     )
                     .await;
-                break;
-            };
-
-            let restart = match self.restart_policy() {
-                RestartPolicy::Always => true,
-                RestartPolicy::OnFailure if exit_status.is_success() => false,
-                RestartPolicy::OnFailure => true,
-                RestartPolicy::Never => false,
-            };
-
-            let restart_disabled = disable_restart.load(atomic::Ordering::Acquire);
-            if restart && restart_disabled {
+                RespawnOutcome::Fatal
+            }
+            Err(err) => {
                 logger
                     .log(
-                        LogLevel::Info,
+                        LogLevel::Error,
                         Some("daemon".into()),
-                        "not restarting node because all inputs are already closed".to_string(),
+                        format!("failed to restart node: {err:?}"),
                     )
                     .await;
-            }
-            let restart = restart && !restart_disabled;
-            let success = exit_status.is_success();
-
-            if !success {
-                let _span = tracing::error_span!(
-                    "node_failure",
-                    node_id = %self.node.id,
-                    dataflow_id = %self.dataflow_id
-                )
-                .entered();
-                tracing::error!("node exited with error: {:?}", exit_status);
-            }
-
-            let event = DoraEvent::SpawnedNodeResult {
-                dataflow_id: self.dataflow_id,
-                node_id: self.node.id.clone(),
-                exit_status,
-                dynamic_node: self.node.kind.dynamic(),
-                restart,
-            }
-            .into();
-            let event = Timestamped {
-                inner: event,
-                timestamp: self.clock.clone().new_timestamp(),
-            };
-            let _ = self.daemon_tx.clone().send(event).await;
-
-            if restart {
-                let restart_sec = self.restart_sec();
-                if restart_sec > 0 {
-                    logger
-                        .log(
-                            LogLevel::Info,
-                            Some("daemon".into()),
-                            format!("waiting {restart_sec}s before restarting node"),
-                        )
-                        .await;
-                    tokio::time::sleep(Duration::from_secs(restart_sec)).await;
-                }
-                if success {
-                    logger
-                        .log(
-                            LogLevel::Info,
-                            Some("daemon".into()),
-                            "restarting node after successful exit".to_string(),
-                        )
-                        .await;
-                } else {
-                    logger
-                        .log(
-                            LogLevel::Warn,
-                            Some("daemon".into()),
-                            "restarting node after failure".to_string(),
-                        )
-                        .await;
-                }
-                let (finished_tx, finished_rx_new) = oneshot::channel();
-                let result = self
-                    .clone()
-                    .spawn_inner(&mut logger, op_rx, finished_tx)
-                    .await;
-                match result {
-                    Ok(NodeKind::Spawned { pid: new_pid }) => {
-                        finished_rx = finished_rx_new;
-                        pid.store(new_pid, atomic::Ordering::Release);
-                    }
-                    Ok(NodeKind::Dynamic) => {
-                        logger
-                            .log(
-                                LogLevel::Error,
-                                Some("daemon".into()),
-                                "cannot restart dynamic node".to_string(),
-                            )
-                            .await;
-                        break;
-                    }
-                    Err(err) => {
-                        logger
-                            .log(
-                                LogLevel::Error,
-                                Some("daemon".into()),
-                                format!("failed to restart node: {err:?}"),
-                            )
-                            .await;
-                        break;
-                    }
-                }
-            } else {
-                break;
+                RespawnOutcome::Fatal
             }
         }
     }

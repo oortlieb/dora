@@ -76,6 +76,12 @@ pub enum DaemonEvent {
         dataflow_id: DataflowId,
         node_id: NodeId,
     },
+    /// A node was manually stopped by a user command and is now parked
+    /// (waiting for a Start command).
+    NodeManuallyStopped {
+        dataflow_id: DataflowId,
+        node_id: NodeId,
+    },
 }
 
 /// Resource metrics for a node process
@@ -111,6 +117,9 @@ pub enum DaemonCoordinatorReply {
     TriggerSpawnResult(Result<(), String>),
     ReloadResult(Result<(), String>),
     StopResult(Result<(), String>),
+    NodeStopResult(Result<(), String>),
+    NodeStartResult(Result<(), String>),
+    NodeKillResult(Result<(), String>),
     DestroyResult {
         result: Result<(), String>,
         #[serde(skip)]

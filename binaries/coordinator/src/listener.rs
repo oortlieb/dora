@@ -142,6 +142,18 @@ pub async fn handle_connection(
                         break;
                     }
                 }
+                DaemonEvent::NodeManuallyStopped {
+                    dataflow_id,
+                    node_id,
+                } => {
+                    let event = Event::NodeManuallyStopped {
+                        dataflow_id,
+                        node_id,
+                    };
+                    if events_tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
                 DaemonEvent::BuildResult { build_id, result } => {
                     let event = Event::DataflowBuildResult {
                         build_id,

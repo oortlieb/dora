@@ -864,6 +864,51 @@ impl Daemon {
 
                 RunStatus::Continue
             }
+            DaemonCoordinatorEvent::StopNode {
+                dataflow_id,
+                node_id,
+                grace_duration,
+            } => {
+                let result = self
+                    .handle_stop_node(dataflow_id, &node_id, grace_duration)
+                    .await;
+                let reply = DaemonCoordinatorReply::NodeStopResult(
+                    result.map_err(|err| format!("{err:?}")),
+                );
+                let _ = reply_tx
+                    .send(Some(reply))
+                    .map_err(|_| error!("could not send node stop reply from daemon to coordinator"));
+                RunStatus::Continue
+            }
+            DaemonCoordinatorEvent::StartNode {
+                dataflow_id,
+                node_id,
+            } => {
+                let result = self.handle_start_node(dataflow_id, &node_id).await;
+                let reply = DaemonCoordinatorReply::NodeStartResult(
+                    result.map_err(|err| format!("{err:?}")),
+                );
+                let _ = reply_tx.send(Some(reply)).map_err(|_| {
+                    error!("could not send node start reply from daemon to coordinator")
+                });
+                RunStatus::Continue
+            }
+            DaemonCoordinatorEvent::KillNode {
+                dataflow_id,
+                node_id,
+                grace_duration,
+            } => {
+                let result = self
+                    .handle_kill_node(dataflow_id, &node_id, grace_duration)
+                    .await;
+                let reply = DaemonCoordinatorReply::NodeKillResult(
+                    result.map_err(|err| format!("{err:?}")),
+                );
+                let _ = reply_tx
+                    .send(Some(reply))
+                    .map_err(|_| error!("could not send node kill reply from daemon to coordinator"));
+                RunStatus::Continue
+            }
             DaemonCoordinatorEvent::Destroy => {
                 tracing::info!("received destroy command -> exiting");
                 let (notify_tx, notify_rx) = oneshot::channel();
@@ -1776,6 +1821,166 @@ impl Daemon {
         Ok(())
     }
 
+    /// Handle a per-node stop command: stop the node and disable its restart policy.
+    async fn handle_stop_node(
+        &mut self,
+        dataflow_id: Uuid,
+        node_id: &NodeId,
+        grace_duration: Option<Duration>,
+    ) -> eyre::Result<()> {
+        let dataflow = self
+            .running
+            .get_mut(&dataflow_id)
+            .wrap_err_with(|| format!("no running dataflow with ID `{dataflow_id}`"))?;
+
+        // Reject if dataflow-level stop is already in progress
+        if dataflow.stop_sent {
+            eyre::bail!("dataflow is already being stopped");
+        }
+
+        let node = dataflow
+            .running_nodes
+            .get_mut(node_id)
+            .wrap_err_with(|| format!("no running node `{node_id}` in dataflow `{dataflow_id}`"))?;
+
+        if node.manually_stopped {
+            eyre::bail!("node `{node_id}` is already manually stopped");
+        }
+        if node.grace_timer_handle.is_some() {
+            eyre::bail!("node `{node_id}` is already being stopped");
+        }
+
+        // Disable restart and send Stop command to the restart loop
+        node.disable_restart();
+        node.send_command(NodeCommand::Stop);
+
+        // Send NodeEvent::Stop to the node process via its subscribe channel
+        if let Some(channel) = dataflow.subscribe_channels.get(node_id) {
+            let _ = send_with_timestamp(channel, NodeEvent::Stop, &self.clock);
+        }
+
+        // Start grace duration timer to force kill if needed.
+        // Store the handle so we can abort it if the node exits cleanly before the timer fires.
+        if let Some(process) = &node.process {
+            let op_tx = process.op_tx.clone();
+            let node_id_clone = node_id.clone();
+            let grace_duration_kills = dataflow.grace_duration_kills.clone();
+            let handle = tokio::spawn(async move {
+                let duration = grace_duration.unwrap_or(Duration::from_millis(10000));
+                tokio::time::sleep(duration).await;
+                if op_tx.send(ProcessOperation::SoftKill).is_ok() {
+                    grace_duration_kills.insert(node_id_clone.clone());
+                }
+                let kill_duration = duration / 2;
+                tokio::time::sleep(kill_duration).await;
+                if op_tx.send(ProcessOperation::Kill).is_ok() {
+                    grace_duration_kills.insert(node_id_clone);
+                }
+            });
+            node.grace_timer_handle = Some(handle);
+        }
+
+        Ok(())
+    }
+
+    /// Handle a per-node start command: start a stopped/parked node and re-enable its restart policy.
+    async fn handle_start_node(
+        &mut self,
+        dataflow_id: Uuid,
+        node_id: &NodeId,
+    ) -> eyre::Result<()> {
+        let dataflow = self
+            .running
+            .get_mut(&dataflow_id)
+            .wrap_err_with(|| format!("no running dataflow with ID `{dataflow_id}`"))?;
+
+        // Reject if dataflow-level stop is already in progress
+        if dataflow.stop_sent {
+            eyre::bail!("cannot start node: dataflow is being stopped");
+        }
+
+        let node = dataflow
+            .running_nodes
+            .get_mut(node_id)
+            .wrap_err_with(|| format!("no running node `{node_id}` in dataflow `{dataflow_id}`"))?;
+
+        if node.grace_timer_handle.is_some() {
+            eyre::bail!("node `{node_id}` is currently shutting down, wait for it to stop before starting");
+        }
+
+        if !node.manually_stopped {
+            // The node might be in restart delay -- the Start command will
+            // skip the delay in the restart_loop. But if it's actually running,
+            // the loop will simply ignore the Start.
+        }
+
+        // Re-enable restart and send Start command to the restart loop
+        node.enable_restart();
+        node.manually_stopped = false;
+        node.send_command(NodeCommand::Start);
+
+        // Clear any stale grace_duration_kills flag
+        dataflow.grace_duration_kills.remove(node_id);
+
+        Ok(())
+    }
+
+    /// Handle a per-node kill command: kill the node process but let the restart policy handle it.
+    async fn handle_kill_node(
+        &mut self,
+        dataflow_id: Uuid,
+        node_id: &NodeId,
+        grace_duration: Option<Duration>,
+    ) -> eyre::Result<()> {
+        let dataflow = self
+            .running
+            .get_mut(&dataflow_id)
+            .wrap_err_with(|| format!("no running dataflow with ID `{dataflow_id}`"))?;
+
+        let node = dataflow
+            .running_nodes
+            .get_mut(node_id)
+            .wrap_err_with(|| format!("no running node `{node_id}` in dataflow `{dataflow_id}`"))?;
+
+        if node.manually_stopped {
+            eyre::bail!("node `{node_id}` is already stopped");
+        }
+        if node.grace_timer_handle.is_some() {
+            eyre::bail!("node `{node_id}` is already being stopped");
+        }
+
+        // Do NOT disable restart -- let the restart policy handle it
+        node.send_command(NodeCommand::Kill);
+
+        // Send NodeEvent::Stop to the node process via its subscribe channel
+        if let Some(channel) = dataflow.subscribe_channels.get(node_id) {
+            let _ = send_with_timestamp(channel, NodeEvent::Stop, &self.clock);
+        }
+
+        // Start grace duration timer to force kill if needed.
+        // Store the handle so we can abort it if the node exits cleanly before the timer fires.
+        if let Some(process) = &node.process {
+            let op_tx = process.op_tx.clone();
+            let node_id_clone = node_id.clone();
+            let grace_duration_kills = dataflow.grace_duration_kills.clone();
+            let handle = tokio::spawn(async move {
+                let duration = grace_duration.unwrap_or(Duration::from_millis(10000));
+                tokio::time::sleep(duration).await;
+                if op_tx.send(ProcessOperation::SoftKill).is_ok() {
+                    grace_duration_kills.insert(node_id_clone.clone());
+                }
+                let kill_duration = duration / 2;
+                tokio::time::sleep(kill_duration).await;
+                if op_tx.send(ProcessOperation::Kill).is_ok() {
+                    grace_duration_kills.insert(node_id_clone);
+                }
+            });
+            node.grace_timer_handle = Some(handle);
+        }
+
+        Ok(())
+    }
+
     async fn send_out(
         &mut self,
         dataflow_id: Uuid,
@@ -2064,7 +2269,7 @@ impl Daemon {
             && dataflow
                 .running_nodes
                 .iter()
-                .all(|(_id, n)| n.node_config.dynamic)
+                .all(|(_id, n)| n.node_config.dynamic || n.manually_stopped)
         {
             let result = DataflowDaemonResult {
                 timestamp: self.clock.new_timestamp(),
@@ -2206,6 +2411,7 @@ impl Daemon {
                 dynamic_node,
                 exit_status,
                 restart,
+                manually_stopped,
             } => {
                 let mut logger = self
                     .logger
@@ -2215,7 +2421,10 @@ impl Daemon {
                     .log(
                         LogLevel::Debug,
                         Some("daemon".into()),
-                        format!("handling node stop with exit status {exit_status:?} (restart: {restart})"),
+                        format!(
+                            "handling node stop with exit status {exit_status:?} \
+                             (restart: {restart}, manually_stopped: {manually_stopped})"
+                        ),
                     )
                     .await;
 
@@ -2288,6 +2497,16 @@ impl Daemon {
                     .await;
 
                 if restart {
+                    // Node will auto-restart: keep outputs open, notify coordinator.
+                    // Cancel any pending grace timer since the node exited on its own.
+                    if let Some(dataflow) = self.running.get_mut(&dataflow_id) {
+                        if let Some(node) = dataflow.running_nodes.get_mut(&node_id) {
+                            if let Some(handle) = node.grace_timer_handle.take() {
+                                handle.abort();
+                            }
+                        }
+                        dataflow.grace_duration_kills.remove(&node_id);
+                    }
                     logger
                         .log(
                             LogLevel::Info,
@@ -2310,7 +2529,47 @@ impl Daemon {
                             .await
                             .wrap_err("failed to send NodeStoppedRestarting to dora-coordinator")?;
                     }
+                } else if manually_stopped {
+                    // Node was manually stopped: keep outputs open, keep in running_nodes,
+                    // mark as manually_stopped, notify coordinator.
+                    // Cancel the grace timer since the node exited on its own.
+                    logger
+                        .log(
+                            LogLevel::Info,
+                            Some("daemon".into()),
+                            "node manually stopped, keeping outputs open",
+                        )
+                        .await;
+                    if let Some(dataflow) = self.running.get_mut(&dataflow_id) {
+                        if let Some(node) = dataflow.running_nodes.get_mut(&node_id) {
+                            node.manually_stopped = true;
+                            // Abort the grace timer so it doesn't fire after the node
+                            // is already stopped (or restarted later).
+                            if let Some(handle) = node.grace_timer_handle.take() {
+                                handle.abort();
+                            }
+                        }
+                        // Also clear any stale grace_duration_kills flag in case the
+                        // timer managed to fire just before we aborted it.
+                        dataflow.grace_duration_kills.remove(&node_id);
+                    }
+                    if let Some(connection) = &mut self.coordinator_connection {
+                        let msg = serde_json::to_vec(&Timestamped {
+                            inner: CoordinatorRequest::Event {
+                                daemon_id: self.daemon_id.clone(),
+                                event: DaemonEvent::NodeManuallyStopped {
+                                    dataflow_id,
+                                    node_id: node_id.clone(),
+                                },
+                            },
+                            timestamp: self.clock.new_timestamp(),
+                        })?;
+                        socket_stream_send(connection, &msg)
+                            .await
+                            .wrap_err("failed to send NodeManuallyStopped to dora-coordinator")?;
+                    }
                 } else {
+                    // Normal stop: close outputs, remove from running_nodes
                     self.dataflow_node_results
                         .entry(dataflow_id)
                         .or_default()
@@ -2567,6 +2826,17 @@ fn close_input(
     }
 }
 
+/// Commands that can be sent to a node's restart loop to control its lifecycle.
+#[derive(Debug)]
+pub enum NodeCommand {
+    /// Stop the node, disable auto-restart, enter parked state.
+    Stop,
+    /// Re-enable restart policy, skip delay / wake from parked state, respawn.
+    Start,
+    /// Stop the node process, but let the restart policy handle normally.
+    Kill,
+}
+
 #[derive(Debug)]
 pub struct RunningNode {
     process: Option<ProcessHandle>,
@@ -2578,6 +2848,14 @@ pub struct RunningNode {
     /// This flag is set when all inputs of the node were closed and when a manual stop command
     /// was sent.
     disable_restart: Arc<AtomicBool>,
+    /// Channel to send control commands (Stop/Start/Kill) to the node's restart loop.
+    command_tx: mpsc::UnboundedSender<NodeCommand>,
+    /// True if the node was manually stopped by a user command and is parked.
+    pub manually_stopped: bool,
+    /// Handle to the grace duration timer task, if any. Present while a stop/kill is in
+    /// progress; aborted and cleared when the node exits or is started. Also used to reject
+    /// Start commands during an active shutdown (if `Some`, a shutdown is underway).
+    grace_timer_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl RunningNode {
@@ -2587,6 +2865,15 @@ impl RunningNode {
 
     pub fn disable_restart(&mut self) {
         self.disable_restart.store(true, atomic::Ordering::Release);
+    }
+
+    pub fn enable_restart(&mut self) {
+        self.disable_restart
+            .store(false, atomic::Ordering::Release);
+    }
+
+    pub fn send_command(&self, cmd: NodeCommand) -> bool {
+        self.command_tx.send(cmd).is_ok()
     }
 }
 
@@ -2638,7 +2925,7 @@ impl ProcessOperation {
 
 #[derive(Debug)]
 struct ProcessHandle {
-    op_tx: flume::Sender<ProcessOperation>,
+    pub(crate) op_tx: flume::Sender<ProcessOperation>,
 }
 
 impl ProcessHandle {
@@ -3046,8 +3333,10 @@ pub enum DoraEvent {
         node_id: NodeId,
         dynamic_node: bool,
         exit_status: NodeExitStatus,
-        /// Whether the node will be restarted
+        /// Whether the node will be restarted automatically
         restart: bool,
+        /// Whether the node was manually stopped by a user command
+        manually_stopped: bool,
     },
 }
 

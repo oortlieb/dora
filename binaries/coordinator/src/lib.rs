@@ -797,9 +797,13 @@ async fn start_inner(
                                             }
                                         });
 
-                                        let stopped = dataflow.node_had_metrics.contains(node_id)
+                                        let manually_stopped =
+                                            dataflow.node_manually_stopped.contains(node_id);
+                                        let stopped = !manually_stopped
+                                            && dataflow.node_had_metrics.contains(node_id)
                                             && !dataflow.node_metrics.contains_key(node_id);
-                                        let restarting = dataflow.node_restarting.contains(node_id);
+                                        let restarting = !manually_stopped
+                                            && dataflow.node_restarting.contains(node_id);
                                         node_infos.push(NodeInfo {
                                             dataflow_id: dataflow.uuid,
                                             dataflow_name: dataflow.name.clone(),
@@ -807,6 +811,7 @@ async fn start_inner(
                                             daemon_id: daemon_id.clone(),
                                             stopped,
                                             restarting,
+                                            manually_stopped,
                                             metrics,
                                         });
                                     }
@@ -814,6 +819,83 @@ async fn start_inner(
                             }
                             let _ = reply_sender
                                 .send(Ok(ControlRequestReply::NodeInfoList(node_infos)));
+                        }
+                        ControlRequest::NodeStop {
+                            dataflow_uuid,
+                            node_id,
+                            grace_duration,
+                        } => {
+                            let result = send_node_command_to_daemon(
+                                &running_dataflows,
+                                dataflow_uuid,
+                                &node_id,
+                                DaemonCoordinatorEvent::StopNode {
+                                    dataflow_id: dataflow_uuid,
+                                    node_id: node_id.clone(),
+                                    grace_duration,
+                                },
+                                &mut daemon_connections,
+                                clock.new_timestamp(),
+                            )
+                            .await
+                            .map(|()| ControlRequestReply::NodeStopped {
+                                uuid: dataflow_uuid,
+                                node_id,
+                            });
+                            let _ = reply_sender.send(result);
+                        }
+                        ControlRequest::NodeStart {
+                            dataflow_uuid,
+                            node_id,
+                        } => {
+                            let result = send_node_command_to_daemon(
+                                &running_dataflows,
+                                dataflow_uuid,
+                                &node_id,
+                                DaemonCoordinatorEvent::StartNode {
+                                    dataflow_id: dataflow_uuid,
+                                    node_id: node_id.clone(),
+                                },
+                                &mut daemon_connections,
+                                clock.new_timestamp(),
+                            )
+                            .await
+                            .map(|()| {
+                                // Clear the manually-stopped state now that the node
+                                // is being started again.
+                                if let Some(dataflow) = running_dataflows.get_mut(&dataflow_uuid) {
+                                    dataflow.node_manually_stopped.remove(&node_id);
+                                }
+                                ControlRequestReply::NodeStarted {
+                                    uuid: dataflow_uuid,
+                                    node_id,
+                                }
+                            });
+                            let _ = reply_sender.send(result);
+                        }
+                        ControlRequest::NodeKill {
+                            dataflow_uuid,
+                            node_id,
+                            grace_duration,
+                        } => {
+                            let result = send_node_command_to_daemon(
+                                &running_dataflows,
+                                dataflow_uuid,
+                                &node_id,
+                                DaemonCoordinatorEvent::KillNode {
+                                    dataflow_id: dataflow_uuid,
+                                    node_id: node_id.clone(),
+                                    grace_duration,
+                                },
+                                &mut daemon_connections,
+                                clock.new_timestamp(),
+                            )
+                            .await
+                            .map(|()| ControlRequestReply::NodeKilled {
+                                uuid: dataflow_uuid,
+                                node_id,
+                            });
+                            let _ = reply_sender.send(result);
                         }
                     }
                 }
@@ -958,6 +1040,15 @@ async fn start_inner(
             } => {
                 if let Some(dataflow) = running_dataflows.get_mut(&dataflow_id) {
                     dataflow.node_restarting.insert(node_id);
+                }
+            }
+            Event::NodeManuallyStopped {
+                dataflow_id,
+                node_id,
+            } => {
+                if let Some(dataflow) = running_dataflows.get_mut(&dataflow_id) {
+                    dataflow.node_manually_stopped.insert(node_id.clone());
+                    dataflow.node_restarting.remove(&node_id);
                 }
             }
             Event::DataflowBuildResult {
@@ -1146,6 +1237,8 @@ struct RunningDataflow {
     node_had_metrics: BTreeSet<NodeId>,
     /// Nodes that have stopped and are scheduled for restart (show "Stopped (Restarting)")
     node_restarting: BTreeSet<NodeId>,
+    /// Nodes that have been manually stopped by a user command (show "Stopped (Manual)")
+    node_manually_stopped: BTreeSet<NodeId>,
 
     spawn_result: CachedResult,
     stop_reply_senders: Vec<tokio::sync::oneshot::Sender<eyre::Result<ControlRequestReply>>>,
@@ -1324,6 +1417,48 @@ async fn reload_dataflow(
     }
     tracing::info!("successfully reloaded dataflow `{dataflow_id}`");
 
+    Ok(())
+}
+
+/// Send a per-node command to the specific daemon running that node.
+async fn send_node_command_to_daemon(
+    running_dataflows: &HashMap<Uuid, RunningDataflow>,
+    dataflow_uuid: Uuid,
+    node_id: &NodeId,
+    event: DaemonCoordinatorEvent,
+    daemon_connections: &mut DaemonConnections,
+    timestamp: uhlc::Timestamp,
+) -> eyre::Result<()> {
+    let Some(dataflow) = running_dataflows.get(&dataflow_uuid) else {
+        bail!("No running dataflow found with UUID `{dataflow_uuid}`")
+    };
+    let Some(daemon_id) = dataflow.node_to_daemon.get(node_id) else {
+        bail!("No daemon found for node `{node_id}` in dataflow `{dataflow_uuid}`")
+    };
+    let message = serde_json::to_vec(&Timestamped {
+        inner: event,
+        timestamp,
+    })?;
+    let daemon_connection = daemon_connections
+        .get_mut(daemon_id)
+        .wrap_err("no daemon connection")?;
+    tcp_send(&mut daemon_connection.stream, &message)
+        .await
+        .wrap_err("failed to send node command to daemon")?;
+    let reply_raw = tcp_receive(&mut daemon_connection.stream)
+        .await
+        .wrap_err("failed to receive node command reply from daemon")?;
+    let reply: DaemonCoordinatorReply = serde_json::from_slice(&reply_raw)
+        .wrap_err("failed to deserialize node command reply from daemon")?;
+    let inner_result = match reply {
+        DaemonCoordinatorReply::NodeStopResult(r) => r,
+        DaemonCoordinatorReply::NodeStartResult(r) => r,
+        DaemonCoordinatorReply::NodeKillResult(r) => r,
+        other => bail!("unexpected reply after sending node command: {other:?}"),
+    };
+    inner_result
+        .map_err(|e| eyre!(e))
+        .wrap_err("node command failed on daemon")?;
     Ok(())
 }
 
@@ -1565,6 +1700,7 @@ async fn start_dataflow(
         node_metrics: BTreeMap::new(),
         node_had_metrics: BTreeSet::new(),
         node_restarting: BTreeSet::new(),
+        node_manually_stopped: BTreeSet::new(),
         spawn_result: CachedResult::default(),
         stop_reply_senders: Vec::new(),
         buffered_log_messages: Vec::new(),
@@ -1663,6 +1799,10 @@ pub enum Event {
         dataflow_id: uuid::Uuid,
         node_id: NodeId,
     },
+    NodeManuallyStopped {
+        dataflow_id: uuid::Uuid,
+        node_id: NodeId,
+    },
 }
 
 impl Event {
@@ -1691,6 +1831,7 @@ impl Event {
             Event::DataflowSpawnResult { .. } => "DataflowSpawnResult",
             Event::NodeMetrics { .. } => "NodeMetrics",
             Event::NodeStoppedRestarting { .. } => "NodeStoppedRestarting",
+            Event::NodeManuallyStopped { .. } => "NodeManuallyStopped",
         }
     }
 }

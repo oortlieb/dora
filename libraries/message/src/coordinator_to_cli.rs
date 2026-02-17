@@ -47,6 +47,18 @@ pub enum ControlRequestReply {
         cli: Option<IpAddr>,
     },
     NodeInfoList(Vec<NodeInfo>),
+    NodeStopped {
+        uuid: Uuid,
+        node_id: NodeId,
+    },
+    NodeStarted {
+        uuid: Uuid,
+        node_id: NodeId,
+    },
+    NodeKilled {
+        uuid: Uuid,
+        node_id: NodeId,
+    },
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -61,6 +73,9 @@ pub struct NodeInfo {
     /// True if the node has stopped and is scheduled to be restarted (e.g. waiting for restart_sec).
     #[serde(default)]
     pub restarting: bool,
+    /// True if the node was manually stopped by a user command and is waiting for a Start command.
+    #[serde(default)]
+    pub manually_stopped: bool,
     pub metrics: Option<NodeMetricsInfo>,
 }
 
