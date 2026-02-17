@@ -1,5 +1,7 @@
 use clap::Args;
+use duration_str::parse;
 use eyre::{Context, bail};
+use std::time::Duration;
 
 use crate::{
     command::{Executable, default_tracing},
@@ -11,6 +13,10 @@ use dora_message::{
     id::NodeId,
 };
 
+use super::wait;
+
+const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Start a stopped or restarting node in a dataflow. This re-enables the node's restart policy.
 #[derive(Debug, Args)]
 pub struct Start {
@@ -20,6 +26,15 @@ pub struct Start {
     /// UUID or name of the dataflow
     #[clap(long, short = 'd', value_name = "UUID_OR_NAME")]
     dataflow: Option<String>,
+
+    /// Block until the node reaches the running state
+    #[clap(long, short = 'w')]
+    wait: bool,
+
+    /// Maximum time to wait for the node to reach the desired state (requires --wait)
+    #[clap(long, value_name = "DURATION", default_value = "30s")]
+    #[arg(value_parser = parse)]
+    wait_timeout: Duration,
 
     #[clap(flatten)]
     coordinator: CoordinatorOptions,
@@ -51,7 +66,20 @@ impl Executable for Start {
 
         match reply {
             ControlRequestReply::NodeStarted { uuid, node_id } => {
-                println!("Started node `{node_id}` in dataflow `{uuid}`");
+                if self.wait {
+                    println!("Starting node `{node_id}` in dataflow `{uuid}`, waiting for it to become running...");
+                    wait::wait_for_node_state(
+                        &mut *session,
+                        uuid,
+                        &node_id,
+                        wait::is_running,
+                        self.wait_timeout,
+                        "running",
+                    )?;
+                    println!("Node `{node_id}` is now running.");
+                } else {
+                    println!("Started node `{node_id}` in dataflow `{uuid}`");
+                }
                 Ok(())
             }
             ControlRequestReply::Error(err) => {

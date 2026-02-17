@@ -4,6 +4,7 @@ mod kill;
 mod list;
 mod start;
 mod stop;
+mod wait;
 
 pub use kill::Kill;
 pub use list::List;

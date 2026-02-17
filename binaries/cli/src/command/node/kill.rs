@@ -13,6 +13,10 @@ use dora_message::{
     id::NodeId,
 };
 
+use super::wait;
+
+const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Kill a running node in a dataflow. Unlike `stop`, this does NOT disable the restart policy.
 ///
 /// If the node has a restart policy (e.g. `always` or `on-failure`), it will be restarted
@@ -30,6 +34,15 @@ pub struct Kill {
     #[clap(long, value_name = "DURATION")]
     #[arg(value_parser = parse)]
     grace_duration: Option<Duration>,
+
+    /// Block until the node process has exited
+    #[clap(long, short = 'w')]
+    wait: bool,
+
+    /// Maximum time to wait for the node to reach the desired state (requires --wait)
+    #[clap(long, value_name = "DURATION", default_value = "30s")]
+    #[arg(value_parser = parse)]
+    wait_timeout: Duration,
 
     #[clap(flatten)]
     coordinator: CoordinatorOptions,
@@ -62,7 +75,20 @@ impl Executable for Kill {
 
         match reply {
             ControlRequestReply::NodeKilled { uuid, node_id } => {
-                println!("Killed node `{node_id}` in dataflow `{uuid}`");
+                if self.wait {
+                    println!("Killing node `{node_id}` in dataflow `{uuid}`, waiting for process to exit...");
+                    wait::wait_for_node_state(
+                        &mut *session,
+                        uuid,
+                        &node_id,
+                        wait::is_killed,
+                        self.wait_timeout,
+                        "killed",
+                    )?;
+                    println!("Node `{node_id}` process has exited.");
+                } else {
+                    println!("Killed node `{node_id}` in dataflow `{uuid}`");
+                }
                 Ok(())
             }
             ControlRequestReply::Error(err) => {

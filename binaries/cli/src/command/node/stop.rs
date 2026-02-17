@@ -13,6 +13,10 @@ use dora_message::{
     id::NodeId,
 };
 
+use super::wait;
+
+const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Stop a running node in a dataflow. This disables the node's restart policy.
 #[derive(Debug, Args)]
 pub struct Stop {
@@ -27,6 +31,15 @@ pub struct Stop {
     #[clap(long, value_name = "DURATION")]
     #[arg(value_parser = parse)]
     grace_duration: Option<Duration>,
+
+    /// Block until the node reaches the stopped state
+    #[clap(long, short = 'w')]
+    wait: bool,
+
+    /// Maximum time to wait for the node to reach the desired state (requires --wait)
+    #[clap(long, value_name = "DURATION", default_value = "30s")]
+    #[arg(value_parser = parse)]
+    wait_timeout: Duration,
 
     #[clap(flatten)]
     coordinator: CoordinatorOptions,
@@ -59,7 +72,20 @@ impl Executable for Stop {
 
         match reply {
             ControlRequestReply::NodeStopped { uuid, node_id } => {
-                println!("Stopped node `{node_id}` in dataflow `{uuid}`");
+                if self.wait {
+                    println!("Stopping node `{node_id}` in dataflow `{uuid}`, waiting for it to become stopped...");
+                    wait::wait_for_node_state(
+                        &mut *session,
+                        uuid,
+                        &node_id,
+                        wait::is_manually_stopped,
+                        self.wait_timeout,
+                        "stopped",
+                    )?;
+                    println!("Node `{node_id}` is now stopped.");
+                } else {
+                    println!("Stopped node `{node_id}` in dataflow `{uuid}`");
+                }
                 Ok(())
             }
             ControlRequestReply::Error(err) => {
