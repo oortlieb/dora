@@ -32,7 +32,8 @@ use std::{
         atomic::{self, AtomicBool, AtomicU32},
     },
 };
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 use tokio::{
     fs::File,
     io::{AsyncBufReadExt, AsyncWriteExt},
@@ -53,6 +54,32 @@ enum RespawnOutcome {
     Ok(oneshot::Receiver<NodeProcessFinished>),
     /// Respawn failed fatally.
     Fatal,
+}
+
+/// systemd-style restart rate limiter (`StartLimitBurst` / `StartLimitIntervalSec`).
+///
+/// Records a restart attempt at `now` and returns whether it is allowed: at most `burst` restarts
+/// are permitted within any rolling `interval` window. Timestamps older than `interval` are pruned
+/// before the check, so failures spaced farther apart than the window never accumulate. When the
+/// attempt is allowed the timestamp is recorded; when denied the deque is left unchanged.
+fn within_restart_limit(
+    restart_times: &mut VecDeque<Instant>,
+    now: Instant,
+    burst: u32,
+    interval: Duration,
+) -> bool {
+    while let Some(&front) = restart_times.front() {
+        if now.duration_since(front) >= interval {
+            restart_times.pop_front();
+        } else {
+            break;
+        }
+    }
+    if restart_times.len() as u32 >= burst {
+        return false;
+    }
+    restart_times.push_back(now);
+    true
 }
 
 #[derive(Clone)]
@@ -133,6 +160,23 @@ impl PreparedNode {
         }
     }
 
+    /// systemd-style restart rate limit as `(burst, interval)`, or `None` when unlimited.
+    ///
+    /// Active only when both `start_limit_burst` and `start_limit_interval_sec` are set and
+    /// positive; otherwise restarts are unlimited (the historical behavior).
+    fn start_limit(&self) -> Option<(u32, Duration)> {
+        let n = match &self.node.kind {
+            dora_core::descriptor::CoreNodeKind::Custom(n) => n,
+            dora_core::descriptor::CoreNodeKind::Runtime(_) => return None,
+        };
+        match (n.start_limit_burst, n.start_limit_interval_sec) {
+            (Some(burst), Some(interval_sec)) if burst > 0 && interval_sec > 0 => {
+                Some((burst, Duration::from_secs(interval_sec)))
+            }
+            _ => None,
+        }
+    }
+
     async fn restart_loop(
         self,
         mut logger: NodeLogger<'static>,
@@ -143,6 +187,8 @@ impl PreparedNode {
     ) {
         // Tracks the op_rx for passing to the next spawn_inner call.
         let mut last_op_rx: Option<flume::Receiver<ProcessOperation>> = None;
+        // Rolling record of recent restart timestamps for systemd-style rate limiting.
+        let mut restart_times: VecDeque<Instant> = VecDeque::new();
         // Use Option to allow taking by value from the loop.
         let mut finished_rx_opt = Some(finished_rx);
 
@@ -295,6 +341,7 @@ impl PreparedNode {
                             &pid,
                             &mut command_rx,
                             &mut last_op_rx,
+                            &mut restart_times,
                         )
                         .await
                     {
@@ -317,6 +364,7 @@ impl PreparedNode {
                             &pid,
                             &mut command_rx,
                             &mut last_op_rx,
+                            &mut restart_times,
                         )
                         .await
                     {
@@ -340,6 +388,7 @@ impl PreparedNode {
         pid: &Arc<AtomicU32>,
         command_rx: &mut mpsc::UnboundedReceiver<NodeCommand>,
         last_op_rx: &mut Option<flume::Receiver<ProcessOperation>>,
+        restart_times: &mut VecDeque<Instant>,
     ) -> NormalExitOutcome {
         let restart = match self.restart_policy() {
             RestartPolicy::Always => true,
@@ -358,7 +407,27 @@ impl PreparedNode {
                 )
                 .await;
         }
-        let restart = restart && !restart_disabled;
+        let mut restart = restart && !restart_disabled;
+
+        // systemd-style rate limit: give up if the node has restarted too many times recently.
+        if restart {
+            if let Some((burst, interval)) = self.start_limit() {
+                if !within_restart_limit(restart_times, Instant::now(), burst, interval) {
+                    logger
+                        .log(
+                            LogLevel::Error,
+                            Some("daemon".into()),
+                            format!(
+                                "node exceeded restart limit ({burst} restarts within {}s), \
+                                 giving up and leaving it stopped",
+                                interval.as_secs()
+                            ),
+                        )
+                        .await;
+                    restart = false;
+                }
+            }
+        }
         let success = exit_status.is_success();
 
         if !success {
@@ -895,4 +964,68 @@ enum NodeKind {
 struct NodeProcessFinished {
     exit_status: NodeExitStatus,
     op_rx: flume::Receiver<ProcessOperation>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::within_restart_limit;
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn allows_up_to_burst_then_denies_within_window() {
+        let mut q = VecDeque::new();
+        let t0 = Instant::now();
+        let burst = 3;
+        let win = Duration::from_secs(10);
+        // burst restarts within the window are allowed
+        assert!(within_restart_limit(&mut q, t0, burst, win));
+        assert!(within_restart_limit(&mut q, t0 + Duration::from_secs(1), burst, win));
+        assert!(within_restart_limit(&mut q, t0 + Duration::from_secs(2), burst, win));
+        // the next restart still inside the window is denied
+        assert!(!within_restart_limit(&mut q, t0 + Duration::from_secs(3), burst, win));
+        // a denied attempt must not consume budget
+        assert_eq!(q.len() as u32, burst);
+    }
+
+    #[test]
+    fn slow_crash_loop_never_trips() {
+        // Crashes spaced wider than the window must restart forever (old timestamps prune away).
+        let mut q = VecDeque::new();
+        let t0 = Instant::now();
+        let burst = 3;
+        let win = Duration::from_secs(10);
+        for i in 0..100 {
+            let now = t0 + Duration::from_secs(i * 11);
+            assert!(within_restart_limit(&mut q, now, burst, win), "iteration {i}");
+            assert_eq!(q.len(), 1);
+        }
+    }
+
+    #[test]
+    fn entry_exactly_at_interval_is_pruned() {
+        let mut q = VecDeque::new();
+        let t0 = Instant::now();
+        let burst = 1;
+        let win = Duration::from_secs(10);
+        assert!(within_restart_limit(&mut q, t0, burst, win));
+        // exactly `interval` later the old entry ages out (half-open window), so allowed again
+        assert!(within_restart_limit(&mut q, t0 + Duration::from_secs(10), burst, win));
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn budget_recovers_after_window_passes() {
+        let mut q = VecDeque::new();
+        let t0 = Instant::now();
+        let burst = 5;
+        let win = Duration::from_secs(30);
+        for i in 0..5 {
+            assert!(within_restart_limit(&mut q, t0 + Duration::from_secs(i), burst, win));
+        }
+        // 6th within the window is denied
+        assert!(!within_restart_limit(&mut q, t0 + Duration::from_secs(5), burst, win));
+        // once the earliest restart ages out, a new attempt is allowed again
+        assert!(within_restart_limit(&mut q, t0 + Duration::from_secs(31), burst, win));
+    }
 }

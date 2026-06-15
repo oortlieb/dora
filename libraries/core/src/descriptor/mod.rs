@@ -94,6 +94,8 @@ impl DescriptorExt for Descriptor {
                     envs: None,
                     restart_policy: node.restart_policy,
                     restart_sec: node.restart_sec,
+                    start_limit_burst: node.start_limit_burst,
+                    start_limit_interval_sec: node.start_limit_interval_sec,
                 }),
                 NodeKindMut::Custom(node) => CoreNodeKind::Custom(node.clone()),
                 NodeKindMut::Runtime(node) => CoreNodeKind::Runtime(node.clone()),
