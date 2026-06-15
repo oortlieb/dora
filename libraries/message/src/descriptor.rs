@@ -491,6 +491,24 @@ pub struct Node {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart_sec: Option<u64>,
 
+    /// Maximum number of restarts allowed within
+    /// [`start_limit_interval_sec`](Self::start_limit_interval_sec).
+    ///
+    /// systemd-style restart rate limiting (`StartLimitBurst`). When a node is restarted more than
+    /// this many times within the rolling interval window, the daemon stops restarting it and lets
+    /// it stay down. Requires `start_limit_interval_sec` to also be set; if either is unset (the
+    /// default), restarts are unlimited, preserving prior behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_limit_burst: Option<u32>,
+
+    /// Rolling time window (in seconds) over which [`start_limit_burst`](Self::start_limit_burst) is
+    /// counted.
+    ///
+    /// systemd-style restart rate limiting (`StartLimitIntervalSec`). Requires `start_limit_burst`;
+    /// if either is unset, restarts are unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_limit_interval_sec: Option<u64>,
+
     /// Unstable machine deployment configuration
     #[schemars(skip)]
     #[serde(rename = "_unstable_deploy")]
@@ -681,6 +699,16 @@ pub struct CustomNode {
     /// Defaults to 0 (restart immediately).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart_sec: Option<u64>,
+
+    /// Maximum restarts within `start_limit_interval_sec` before the daemon gives up
+    /// (systemd-style `StartLimitBurst`). Unlimited if either limit field is unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_limit_burst: Option<u32>,
+
+    /// Rolling window (seconds) over which `start_limit_burst` is counted
+    /// (systemd-style `StartLimitIntervalSec`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_limit_interval_sec: Option<u64>,
 
     #[serde(flatten)]
     pub run_config: NodeRunConfig,
